@@ -46,3 +46,31 @@ class BoundedBatchTest(unittest.TestCase):
         forecaster = self.forecaster(batch_size)
         with self.assertRaisesRegex(ValueError, "per_core_batch_size must be positive"):
           list(forecaster.predict_batch([np.ones(64, dtype=np.float32)], horizon=8))
+
+
+  def test_compiled_frozen_stats_matches_eager_across_context_shapes(self):
+    # Exercise the new freeze_after scalar through mx.compile, including a
+    # cached shape revisited after a different context boundary. Shared tiny
+    # weights isolate compilation from checkpoint provenance or downloads.
+    for frozen in (False, True):
+      with self.subTest(frozen=frozen):
+        mx.random.seed(11)
+        model = TimesFM3Mlx(
+          TimesFM3MlxConfig(
+            input_patch_len=8, output_patch_len=16,
+            model_dims=32, hidden_dims=32, num_layers=1, num_heads=4,
+            use_frozen_running_stats=frozen,
+          ),
+          compile=False,
+        )
+        for context_length in (32, 48, 32):
+          target = mx.array(np.sin(np.arange(context_length) / 5).astype(np.float32))[None, None]
+          future = mx.array(np.linspace(-3, 12, context_length + 8).astype(np.float32))[None, None]
+          model._use_compile = False
+          eager = np.array(model.decode(target, 8, past_future_covariates=future))
+          model._use_compile = True
+          compiled = np.array(model.decode(target, 8, past_future_covariates=future))
+          self.assertIsNotNone(model._compiled_forward)
+          self.assertEqual(compiled.shape, eager.shape)
+          self.assertTrue(np.isfinite(compiled).all())
+          np.testing.assert_allclose(compiled, eager, rtol=1e-4, atol=1e-4)
