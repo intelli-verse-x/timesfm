@@ -30,9 +30,12 @@ class BoundedBatchTest(unittest.TestCase):
       outputs = list(forecaster.predict_batch(contexts, horizon=8, ts_ids=ids,
                                              return_quantiles=True))
       batch_sizes = [call.args[0].shape[0] for call in decode.call_args_list]
+      self.assertTrue(all(call.args[1] == 64 for call in decode.call_args_list))
     self.assertEqual(batch_sizes, [2, 2, 1, 2])
     self.assertEqual([output.ts_id for output in outputs], ids)
     for context, output in zip(contexts, outputs):
+      self.assertEqual(output.forecast.shape, (8,))
+      self.assertEqual(output.quantiles.shape[0], 8)
       single = forecaster.predict(context, horizon=8, return_quantiles=True)
       np.testing.assert_allclose(output.forecast, single.forecast, atol=1e-4)
       np.testing.assert_allclose(output.quantiles, single.quantiles, atol=1e-4)

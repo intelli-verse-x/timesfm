@@ -145,7 +145,9 @@ class RotaryPositionalEmbedding(nn.Module):
     first_half, second_half = inputs.chunk(2, dim=-1)
     first_part = first_half * cos_val - second_half * sin_val
     second_part = second_half * cos_val + first_half * sin_val
-    return torch.cat([first_part, second_part], dim=-1)
+    # Compute rotation angles in float32, but keep Q/K in the input dtype
+    # so attention can combine them with the value projection.
+    return torch.cat([first_part, second_part], dim=-1).to(inputs.dtype)
 
 
 class MultiHeadAttention(nn.Module):
@@ -382,7 +384,7 @@ class MultiHeadAttention(nn.Module):
         query = query * math.sqrt(self.head_dim)
         attn_logits = torch.matmul(query, key.transpose(-2, -1)) + float_mask
       attn_weights = F.softmax(attn_logits, dim=-1)
-      x = torch.matmul(attn_weights, value)
+      x = torch.matmul(attn_weights.to(value.dtype), value)
 
     # Transpose back: (b, h, n, d) -> (b, n, h, d)
     x = x.transpose(1, 2).contiguous()
@@ -392,6 +394,27 @@ class MultiHeadAttention(nn.Module):
 
     out = self.out_proj(x)
     return out, decode_cache, attn_mask
+
+  def single_position_forward(self, inputs_q: torch.Tensor) -> torch.Tensor:
+    """Attention over a length-1 sequence without a KV cache.
+
+    Softmax over a single key is exactly 1, so the output is the (optionally
+    normalized) value projection. Q/K projections, RoPE, QK-norm, PerDimScale
+    and the attention kernel do not change the result and are skipped.
+
+    Args:
+      inputs_q: Shape (b, 1, d).
+
+    Returns:
+      Shape (b, 1, d).
+    """
+    value = self.value_proj(inputs_q)
+    if self.value_ln is not None:
+      batch_size = inputs_q.shape[0]
+      value = self.value_ln(
+        value.view(batch_size, 1, self.num_heads, self.head_dim)
+      ).view(batch_size, 1, self.in_features)
+    return self.out_proj(value)
 
 
 class MixingTransformer(nn.Module):
@@ -415,6 +438,8 @@ class MixingTransformer(nn.Module):
     super().__init__()
     self.config = config
     self.use_variate_attention = use_variate_attention
+    # Tests turn this off to compare against the full attention kernel.
+    self._single_variate_fast_path = True
 
     # Sequence attention norms + module
     self.pre_seq_attn_ln = nn.RMSNorm(config.model_dims)
@@ -513,7 +538,13 @@ class MixingTransformer(nn.Module):
     h1 = self.post_seq_attn_ln(seq_attn_out) + input_embeddings
 
     # --- Variate Attention ---
-    if self.use_variate_attention:
+    if self.use_variate_attention and v == 1 and self._single_variate_fast_path:
+      # One variate: attention over a single key is the value projection.
+      # (b, 1, n, d) -> (b*n, 1, d) is a pure view, no permute needed.
+      var_attn_in = self.pre_var_attn_ln(h1).reshape(b * n, 1, d)
+      var_attn_out = self.var_attn.single_position_forward(var_attn_in)
+      h2 = self.post_var_attn_ln(var_attn_out.view(b, v, n, d)) + h1
+    elif self.use_variate_attention:
       var_attn_in = self.pre_var_attn_ln(h1)
       # (b, v, n, d) -> (b*n, v, d)
       var_attn_in_flat = var_attn_in.permute(0, 2, 1, 3).reshape(b * n, v, d)

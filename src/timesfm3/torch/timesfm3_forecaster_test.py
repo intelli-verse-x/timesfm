@@ -21,7 +21,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-from . import configs, timesfm3_forecaster
+from . import configs, evaluator, timesfm3_forecaster
 from . import model as torch_model_lib
 
 
@@ -41,9 +41,12 @@ class FakeModel(torch.nn.Module):
     horizon=8,
     past_only_covariates=None,
     past_future_covariates=None,
+    past_only_mask=None,
+    past_future_mask=None,
     mask=None,
   ):
     del autoregressive_index, past_only_covariates, past_future_covariates, mask
+    del past_only_mask, past_future_mask
     b, v, _ = target.shape
     shape = (b, v, horizon, self.quantiles)
     return torch.ones(shape, dtype=torch.float32) * 2.0
@@ -193,6 +196,96 @@ class TimesFM3ForecasterTest(unittest.TestCase):
       out = forecaster.predict(ctx, horizon=8)
       self.assertEqual(out.forecast.shape, (8,))
 
+  def test_local_checkpoint_file_uses_published_architecture(self):
+    # A local .safetensors/.pth file has no config.json, so _make_torch_model
+    # supplies the architecture. It must match google/timesfm-3.0-pytorch's
+    # config.json (use_rope_var=False). RoPE has no weights, so a mismatch
+    # loads without error and silently changes multivariate and covariate
+    # forecasts.
+    with mock.patch.object(torch_model_lib, "TimesFM3Torch") as model_cls:
+      timesfm3_forecaster._make_torch_model(timesfm3_forecaster._ModelConfig())
+    transformer = model_cls.call_args.kwargs["transformer_config"].transformer
+    self.assertTrue(transformer.use_rope_seq)
+    self.assertFalse(transformer.use_rope_var)
+
+
+class TimesFM3ForecasterUseSdpaTest(unittest.TestCase):
+  """ModelConfig.use_sdpa must reach every attention module."""
+
+  def setUp(self):
+    super().setUp()
+    torch.manual_seed(0)
+    self.resblock_config = configs.ResidualBlockConfig(
+      hidden_dims=16, output_dims=16, use_bias=False, activation="relu"
+    )
+    self.transformer_config = configs.StackedTransformersConfig(
+      num_layers=2,
+      transformer=configs.TransformerConfig(
+        model_dims=16,
+        hidden_dims=16,
+        num_heads=2,
+        attention_norm="rms",
+        feedforward_norm="rms",
+        qk_norm="rms",
+        use_rope_seq=True,
+        use_rope_var=False,
+        use_bias=False,
+        ff_activation="relu",
+        deterministic=True,
+      ),
+    )
+    self.model = torch_model_lib.TimesFM3Torch(
+      input_patch_len=8,
+      output_patch_len=16,
+      quantiles=[0.1, 0.5, 0.9],
+      residual_block_config=self.resblock_config,
+      transformer_config=self.transformer_config,
+    )
+    self.model.pre_transformer_resblock.set_input_dims(2 * (8 + 16))
+    for p in self.model.parameters():
+      torch.nn.init.normal_(p, std=0.2)
+    self.context = np.sin(np.arange(64, dtype=np.float64) / 3.0) * 5.0 + 10.0
+
+  def _assert_use_sdpa(self, forecaster, expected):
+    layers = forecaster.model.transformer_stack.layers
+    self.assertEqual(len(layers), 2)
+    for layer in layers:
+      self.assertIs(layer.seq_attn.use_sdpa, expected)
+      self.assertIs(layer.var_attn.use_sdpa, expected)
+
+  def test_use_sdpa_local_checkpoint_file(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      path = f"{tmpdir}/model.pt"
+      torch.save(self.model.state_dict(), path)
+      outputs = {}
+      for use_sdpa in (True, False):
+        forecaster = timesfm3_forecaster.TimesFM3Forecaster(
+          checkpoint_path=path,
+          device="cpu",
+          input_patch_length=8,
+          output_patch_length=16,
+          quantiles=[0.1, 0.5, 0.9],
+          median_quantile_index=1,
+          residual_block_config=self.resblock_config,
+          transformer_config=self.transformer_config,
+          use_sdpa=use_sdpa,
+        )
+        self._assert_use_sdpa(forecaster, use_sdpa)
+        outputs[use_sdpa] = forecaster.predict(self.context, horizon=16).forecast
+    np.testing.assert_allclose(outputs[True], outputs[False], rtol=1e-4, atol=1e-4)
+
+  def test_use_sdpa_from_pretrained(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self.model.save_pretrained(tmpdir)
+      outputs = {}
+      for use_sdpa in (True, False):
+        forecaster = timesfm3_forecaster.TimesFM3Forecaster.from_pretrained(
+          tmpdir, device="cpu", use_sdpa=use_sdpa
+        )
+        self._assert_use_sdpa(forecaster, use_sdpa)
+        outputs[use_sdpa] = forecaster.predict(self.context, horizon=16).forecast
+    np.testing.assert_allclose(outputs[True], outputs[False], rtol=1e-4, atol=1e-4)
+
 
 class _RecordingFakeModel(FakeModel):
   """FakeModel that records decode inputs and infers horizon like the real model."""
@@ -208,8 +301,11 @@ class _RecordingFakeModel(FakeModel):
     horizon=8,
     past_only_covariates=None,
     past_future_covariates=None,
+    past_only_mask=None,
+    past_future_mask=None,
     mask=None,
   ):
+    del past_only_mask, past_future_mask
     if past_future_covariates is not None:
       horizon = past_future_covariates.shape[-1] - target.shape[-1]
     self.calls.append(
@@ -381,6 +477,88 @@ class TimesFM3ForecasterCovariateWindowTest(unittest.TestCase):
       )
     )
     self.assertEqual(len(outputs), 3)
+
+  def test_evaluator_predict_batch_accepts_2d_array(self):
+    # Same as above for TimesFM3Evaluator, which had its own `if not contexts`
+    # guard. Cover both the default and the univariate=True paths.
+    with mock.patch.object(
+      evaluator.TimesFM3Evaluator, "_init_model", autospec=True
+    ):
+      ev = evaluator.TimesFM3Evaluator(self.config)
+    ev.model = _RecordingFakeModel()
+    ev.device = torch.device("cpu")
+    contexts = np.random.rand(3, 12).astype(np.float32)
+    for univariate in (False, True):
+      outputs = list(
+        ev.predict_batch(contexts=contexts, horizon=4, univariate=univariate)
+      )
+      self.assertEqual([o.forecast.shape for o in outputs], [(4,)] * 3)
+
+
+class TimesFM3ForecasterCovariatePlaceholderTest(unittest.TestCase):
+  """A query without covariates must not depend on its batch mates' covariates."""
+
+  def _forecaster(self):
+    torch.manual_seed(0)
+    model = torch_model_lib.TimesFM3Torch(
+      input_patch_len=8,
+      output_patch_len=16,
+      quantiles=[0.1, 0.5, 0.9],
+      residual_block_config=configs.ResidualBlockConfig(
+        hidden_dims=16, output_dims=16, use_bias=False, activation="relu"
+      ),
+      transformer_config=configs.StackedTransformersConfig(
+        num_layers=1,
+        transformer=configs.TransformerConfig(
+          model_dims=16,
+          hidden_dims=16,
+          num_heads=2,
+          attention_norm="rms",
+          feedforward_norm="rms",
+          qk_norm="rms",
+          use_rope_seq=True,
+          use_rope_var=False,
+          use_bias=False,
+          ff_activation="relu",
+          deterministic=True,
+        ),
+      ),
+    )
+    # Perturb every weight (norm scales are zero-initialized) so the
+    # covariate channels actually influence the output.
+    with torch.no_grad():
+      for p in model.parameters():
+        p.add_(torch.randn_like(p) * 0.3)
+    with tempfile.TemporaryDirectory() as tmpdir:
+      model.save_pretrained(tmpdir)
+      forecaster = timesfm3_forecaster.TimesFM3Forecaster.from_pretrained(
+        tmpdir, device="cpu"
+      )
+    forecaster.config.per_core_batch_size = 2
+    return forecaster
+
+  def test_no_covariate_query_unaffected_by_batch_mate(self):
+    forecaster = self._forecaster()
+    rng = np.random.default_rng(0)
+    horizon = 16
+    # Same context length, so no padding differs between the two runs.
+    ctx_a = (np.sin(np.arange(64) / 3) + 5).astype(np.float32)
+    ctx_b = (np.cos(np.arange(64) / 5) * 3).astype(np.float32)
+    pf_b = rng.normal(size=64 + horizon).astype(np.float32)
+    po_b = rng.normal(size=64).astype(np.float32)
+
+    alone = next(iter(forecaster.predict_batch([ctx_a], horizon=horizon)))
+    for kwargs in (
+      {"past_future_covariates": [None, pf_b]},
+      {"past_only_covariates": [None, po_b]},
+    ):
+      with self.subTest(**{k: "set" for k in kwargs}):
+        batched = list(
+          forecaster.predict_batch([ctx_a, ctx_b], horizon=horizon, **kwargs)
+        )
+        np.testing.assert_allclose(
+          batched[0].forecast, alone.forecast, rtol=1e-4, atol=1e-4
+        )
 
 
 if __name__ == "__main__":
