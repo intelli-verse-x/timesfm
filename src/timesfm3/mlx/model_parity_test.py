@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -74,6 +75,9 @@ def _build_torch_model(
   causal_attention: bool = True,
   use_rope_var: bool = False,
   use_memory_efficient_attention: bool = True,
+  use_bias: bool = False,
+  qk_norm: str = "rms",
+  use_frozen_running_stats: bool = False,
   seed: int = 0,
 ):
   import torch
@@ -85,7 +89,7 @@ def _build_torch_model(
   resblock_cfg = torch_configs.ResidualBlockConfig(
     hidden_dims=_MODEL_DIMS,
     output_dims=_MODEL_DIMS,
-    use_bias=False,
+    use_bias=use_bias,
     activation=activation,
   )
   transformer_cfg = torch_configs.StackedTransformersConfig(
@@ -97,11 +101,11 @@ def _build_torch_model(
       num_heads=_NUM_HEADS,
       attention_norm="rms",
       feedforward_norm="rms",
-      qk_norm="rms",
+      qk_norm=qk_norm,
       v_norm=v_norm,
       use_rope_seq=True,
       use_rope_var=use_rope_var,
-      use_bias=False,
+      use_bias=use_bias,
       ff_activation=ff_activation,
       deterministic=True,
       use_sdpa=True,
@@ -118,7 +122,7 @@ def _build_torch_model(
     use_stitching=use_stitching,
     use_linear_detrending=True,
     use_iterative_cpm_revin=use_iterative_cpm_revin,
-    use_frozen_running_stats=False,
+    use_frozen_running_stats=use_frozen_running_stats,
   )
   model.eval()
   return model
@@ -134,6 +138,9 @@ def _build_mlx_model(
   causal_attention: bool = True,
   use_rope_var: bool = False,
   use_memory_efficient_attention: bool = True,
+  use_bias: bool = False,
+  qk_norm: str = "rms",
+  use_frozen_running_stats: bool = False,
 ) -> "mlx_model_lib.TimesFM3Mlx":
   cfg = mlx_configs.TimesFM3MlxConfig(
     input_patch_len=_INPUT_PATCH_LEN,
@@ -155,6 +162,10 @@ def _build_mlx_model(
     causal_attention=causal_attention,
     use_rope_var=use_rope_var,
     use_memory_efficient_attention=use_memory_efficient_attention,
+    use_bias=use_bias,
+    qk_norm=qk_norm,
+    residual_use_bias=use_bias,
+    use_frozen_running_stats=use_frozen_running_stats,
   )
   return mlx_model_lib.TimesFM3Mlx(cfg, compile=False)
 
@@ -183,6 +194,9 @@ def _build_pair(**torch_kwargs):
     causal_attention=torch_kwargs.get("causal_attention", True),
     use_rope_var=torch_kwargs.get("use_rope_var", False),
     use_memory_efficient_attention=torch_kwargs.get("use_memory_efficient_attention", True),
+    use_bias=torch_kwargs.get("use_bias", False),
+    qk_norm=torch_kwargs.get("qk_norm", "rms"),
+    use_frozen_running_stats=torch_kwargs.get("use_frozen_running_stats", False),
   )
   _transplant(torch_model, mlx_model)
   return torch_model, mlx_model
@@ -339,6 +353,82 @@ class TimesFM3KnownDivergenceTest(unittest.TestCase):
     ctx = np.random.RandomState(2).randn(1, 2, 128).astype(np.float32)
     torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
     np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_use_bias_true_is_ignored_by_mlx(self):
+    # mlx/dense.py's ResidualBlock and mlx/transformer.py's attention/FFN linears read their
+    # bias flag from TimesFM3MlxConfig.residual_use_bias / use_bias, matching torch's
+    # ResidualBlockConfig.use_bias / TransformerConfig.use_bias.
+    torch_model, mlx_model = _build_pair(use_bias=True)
+    ctx = np.random.RandomState(0).randn(1, 1, 128).astype(np.float32)
+    torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_qk_norm_none_is_ignored_by_mlx(self):
+    # mlx/transformer.py's MultiHeadAttention only builds/applies query_ln and key_ln when
+    # cfg.qk_norm == "rms", matching torch's qk_norm == "none" (no RMSNorm submodules at all).
+    torch_model, mlx_model = _build_pair(qk_norm="none")
+    ctx = np.random.RandomState(2).randn(1, 2, 128).astype(np.float32)
+    torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_use_frozen_running_stats_true_is_ignored_by_mlx(self):
+    # torch/model.py freezes the RevIN running mean/std at the context boundary
+    # (freeze_after = num_context_patches - 1) so past-future covariate values in the horizon
+    # don't leak into normalization stats. mlx/model.py mirrors this in _forward_logits. With no
+    # covariates the horizon is fully masked either way, so this needs past_future_covariates to
+    # actually exercise the divergence.
+    rng = np.random.RandomState(42)
+    target = rng.randn(1, 1, 128).astype(np.float32)
+    pf = rng.randn(1, 1, 128 + 24).astype(np.float32)
+    torch_model, mlx_model = _build_pair(use_frozen_running_stats=True)
+    torch_out, mlx_out = _decode_both(
+      torch_model, mlx_model, target, horizon=24, past_future_covariates=pf
+    )
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+
+@unittest.skipUnless(_HAS_MLX, "mlx is not installed (Apple silicon only)")
+@unittest.skipUnless(_torch_available(), "requires torch as the parity oracle")
+class TimesFM3ForecasterParityTest(unittest.TestCase):
+  """Forecaster-level parity: predict() of both backends on shared weights."""
+
+  def _build_forecasters(self):
+    # Production patch sizes (32 in / 64 out). The torch forecaster decodes at the
+    # horizon rounded up to whole output patches and trims, so a horizon that is
+    # not a multiple of 64 only matches if MLX does the same.
+    import torch
+
+    from ..torch import timesfm3_forecaster as torch_forecaster
+    from . import timesfm3_forecaster as mlx_forecaster
+
+    with mock.patch.dict(globals(), _INPUT_PATCH_LEN=32, _OUTPUT_PATCH_LEN=64):
+      torch_model, mlx_model = _build_pair()
+    t = torch_forecaster.TimesFM3Forecaster.__new__(torch_forecaster.TimesFM3Forecaster)
+    t.config = torch_forecaster._ModelConfig(
+      input_patch_length=32,
+      output_patch_length=64,
+      quantiles=_QUANTILES,
+      median_quantile_index=1,
+      device="cpu",
+    )
+    t.device = torch.device("cpu")
+    t.model = torch_model
+    m = mlx_forecaster.TimesFM3Forecaster.__new__(mlx_forecaster.TimesFM3Forecaster)
+    m.config = mlx_forecaster._ModelConfig(median_quantile_index=1, compile=False)
+    m.model = mlx_model
+    return t, m
+
+  def test_predict_horizon_not_multiple_of_output_patch(self):
+    t, m = self._build_forecasters()
+    rng = np.random.RandomState(0)
+    ctx = (100 + np.cumsum(rng.randn(512))).astype(np.float32)
+    # A 1D target takes the MLX batched fast path; a 2D one the general path.
+    for c in (ctx, np.stack([ctx, ctx[::-1]])):
+      torch_out = t.predict(c, horizon=80, return_quantiles=True)
+      mlx_out = m.predict(c, horizon=80, return_quantiles=True)
+      self.assertEqual(mlx_out.forecast.shape, torch_out.forecast.shape)
+      np.testing.assert_allclose(torch_out.forecast, mlx_out.forecast, atol=1e-3)
+      np.testing.assert_allclose(torch_out.quantiles, mlx_out.quantiles, atol=1e-3)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ import gc
 import math
 import os
 from collections.abc import Iterator
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -28,6 +29,7 @@ import torch
 
 from . import configs, util
 from . import model as torch_model_lib
+from . import transformer as transformer_lib
 
 _MAX_CONTEXT_LENGTH = 15360
 _SIGMA_THRESHOLD: float = 1e-7
@@ -303,12 +305,20 @@ def _make_torch_model(
         feedforward_norm="rms",
         qk_norm="rms",
         use_rope_seq=True,
-        use_rope_var=True,
+        # Must match the published checkpoint (config.json) and TimesFM3Torch.
+        use_rope_var=False,
         use_bias=False,
         ff_activation="relu",
         deterministic=True,
       ),
     )
+  )
+  # SDPA is a runtime choice with no weights, so ModelConfig.use_sdpa wins.
+  transformer_config = dataclasses.replace(
+    transformer_config,
+    transformer=dataclasses.replace(
+      transformer_config.transformer, use_sdpa=config.use_sdpa
+    ),
   )
 
   t_model = torch_model_lib.TimesFM3Torch(
@@ -412,6 +422,10 @@ class TimesFM3Forecaster:
         use_frozen_running_stats=self.model.use_frozen_running_stats,
         input_transform=self.model.input_transform,
       )
+      # SDPA has no weights, so honour ModelConfig.use_sdpa over config.json.
+      for module in self.model.modules():
+        if isinstance(module, transformer_lib.MultiHeadAttention):
+          module.use_sdpa = self.config.use_sdpa
     else:
       # Local file (.safetensors or .pth / .pt)
       self.model = _make_torch_model(self.config)
@@ -477,6 +491,16 @@ class TimesFM3Forecaster:
     padding_mode: str = "none",
   ) -> Iterator[ForecastOutput]:
     """Runs inference on a batch of time series with optional covariates."""
+    if isinstance(horizon, bool) or not isinstance(horizon, Integral) or horizon <= 0:
+      raise ValueError("horizon must be a positive integer.")
+    for name, values in (
+      ("ts_ids", ts_ids),
+      ("past_only_covariates", past_only_covariates),
+      ("past_future_covariates", past_future_covariates),
+    ):
+      if values is not None and len(values) != len(contexts):
+        raise ValueError(f"{name} must contain one entry per context.")
+
     global_horizon = (
       math.ceil(horizon / self.config.output_patch_length)
       * self.config.output_patch_length
@@ -503,6 +527,26 @@ class TimesFM3Forecaster:
     pf_2d: list[np.ndarray | None] = []
 
     for idx, ctx in enumerate(contexts):
+      if (
+        np.ndim(ctx) not in (1, 2)
+        or np.shape(ctx)[-1] == 0
+        or (np.ndim(ctx) == 2 and np.shape(ctx)[0] == 0)
+      ):
+        raise ValueError(
+          f"contexts[{idx}] must have at least one time step and, for 2D"
+          " inputs, at least one variate."
+        )
+      for name, covariate, expected_length in (
+        ("past_only_covariates", po_cov_list[idx], np.shape(ctx)[-1]),
+        ("past_future_covariates", pf_cov_list[idx], np.shape(ctx)[-1] + horizon),
+      ):
+        if covariate is not None and (
+          np.ndim(covariate) not in (1, 2)
+          or np.shape(covariate)[-1] != expected_length
+        ):
+          raise ValueError(
+            f"{name}[{idx}] must be a 1D or 2D array with time length {expected_length}."
+          )
       target_clean = np.atleast_2d(np.array(ctx, dtype=np.float32))
       po = po_cov_list[idx]
       po_arr = np.atleast_2d(np.array(po, dtype=np.float32)) if po is not None else None
@@ -552,7 +596,7 @@ class TimesFM3Forecaster:
           f" {ctx.shape[0]}."
         )
 
-    was_1d_input = len(contexts) > 0 and np.ndim(contexts[0]) == 1
+    was_1d_input = [np.ndim(context) == 1 for context in contexts]
 
     znorm_per_example: list[list[tuple[float, float]]] = []
     if use_znorm:
@@ -678,6 +722,7 @@ class TimesFM3Forecaster:
       )
 
       po_torch = None
+      po_mask_torch = None
       if any(po is not None for po in batched_po):
         # A query without covariates in a batch where others have them gets
         # a zero placeholder shaped like the real covariate arrays (channel
@@ -689,8 +734,15 @@ class TimesFM3Forecaster:
         po_torch = torch.from_numpy(np.stack(po_arrs, axis=0)).to(
           self.device, dtype=torch.float32
         )
+        # Mask the placeholder rows so decode ignores them instead of
+        # reading them as an observed all-zero covariate.
+        po_mask = [np.full(po_ref.shape, po is None) for po in batched_po]
+        po_mask_torch = torch.from_numpy(np.stack(po_mask, axis=0)).to(
+          self.device, dtype=torch.bool
+        )
 
       pf_torch = None
+      pf_mask_torch = None
       if any(pf is not None for pf in batched_pf):
         # Same for past-future covariates. decode infers the horizon from
         # the covariate width (pf.shape[-1] - context) and slices the future
@@ -703,6 +755,10 @@ class TimesFM3Forecaster:
         pf_torch = torch.from_numpy(np.stack(pf_arrs, axis=0)).to(
           self.device, dtype=torch.float32
         )
+        pf_mask = [np.full(pf_ref.shape, pf is None) for pf in batched_pf]
+        pf_mask_torch = torch.from_numpy(np.stack(pf_mask, axis=0)).to(
+          self.device, dtype=torch.bool
+        )
 
       with torch.inference_mode():
         out_logits = self.model.decode(
@@ -710,9 +766,13 @@ class TimesFM3Forecaster:
           horizon=batched_hor[0],
           past_only_covariates=po_torch,
           past_future_covariates=pf_torch,
+          past_only_mask=po_mask_torch,
+          past_future_mask=pf_mask_torch,
           mask=mask_torch,
         )
-      ys.append(out_logits.cpu().numpy())
+      # Covariates can make decode return the exact horizon while a batch
+      # without them returns the patch-rounded horizon. Trim before stacking.
+      ys.append(out_logits[:, :num_targets_in, :horizon, :].cpu().numpy())
 
     try_gc(self.device)
     all_raw_outputs = np.concatenate(ys, axis=0)
@@ -738,7 +798,7 @@ class TimesFM3Forecaster:
 
     if make_positive:
       for i in range(num_original_ts):
-        if was_1d_input:
+        if was_1d_input[i]:
           if _is_nonnegative(contexts[i]):
             all_raw_outputs[i] = np.maximum(all_raw_outputs[i], 0.0)
         else:
@@ -750,7 +810,7 @@ class TimesFM3Forecaster:
 
     for i in range(num_original_ts):
       raw = all_raw_outputs[i]
-      if was_1d_input:
+      if was_1d_input[i]:
         raw = raw[0]
         yield ForecastOutput(
           ts_id=original_ts_ids[i],

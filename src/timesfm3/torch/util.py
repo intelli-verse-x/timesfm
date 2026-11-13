@@ -119,43 +119,29 @@ def update_running_stats(
     Tuple of (new_n, new_mu, new_sigma), each of shape (b, v).
   """
   is_legit = ~mask
-  is_legit_f = is_legit.float()
-  inc_n = is_legit_f.sum(dim=-1)
+  inc_n = is_legit.float().sum(dim=-1)
+  safe_inc_n = inc_n.clamp_min(1.0)
 
   # mean of valid elements in patch
-  x_masked = torch.where(is_legit, x, torch.zeros_like(x))
+  x_masked = x.masked_fill(mask, 0.0)
   inc_sum = x_masked.sum(dim=-1)
-  inc_mu = torch.where(inc_n == 0, torch.zeros_like(inc_sum), inc_sum / inc_n)
+  inc_mu = inc_sum / safe_inc_n
 
-  # std of valid elements in patch
-  x_diff_sq = torch.where(
-    is_legit, (x - inc_mu.unsqueeze(-1)) ** 2, torch.zeros_like(x)
-  )
-  inc_var = torch.where(
-    inc_n == 0,
-    torch.zeros_like(inc_sum),
-    x_diff_sq.sum(dim=-1) / inc_n,
-  )
-  inc_sigma = torch.sqrt(inc_var)
+  # Keep the variance until the final square root; converting it to a
+  # standard deviation and squaring it again only creates extra tensors.
+  x_diff_sq = (x_masked - inc_mu.unsqueeze(-1)).square().masked_fill(mask, 0.0)
+  inc_var = x_diff_sq.sum(dim=-1) / safe_inc_n
 
   new_n = n + inc_n
-  new_mu = torch.where(
-    new_n == 0,
-    torch.zeros_like(mu),
-    (n * mu + inc_mu * inc_n) / new_n,
-  )
+  safe_new_n = new_n.clamp_min(1.0)
+  new_mu = (n * mu + inc_sum) / safe_new_n
   new_sigma = torch.sqrt(
-    torch.where(
-      new_n == 0,
-      torch.zeros_like(sigma),
-      (
-        n * sigma * sigma
-        + inc_n * inc_sigma * inc_sigma
-        + n * (mu - new_mu) * (mu - new_mu)
-        + inc_n * (inc_mu - new_mu) * (inc_mu - new_mu)
-      )
-      / new_n,
-    )
+    (
+      n * sigma.square()
+      + inc_n * inc_var
+      + n * (mu - new_mu).square()
+      + inc_n * (inc_mu - new_mu).square()
+    ) / safe_new_n
   )
   return new_n, new_mu, new_sigma
 
@@ -251,10 +237,11 @@ def revin(
     sigma = sigma.unsqueeze(-1).unsqueeze(-1)
   else:
     raise ValueError(f"Unsupported shapes for x and mu: {x.shape}, {mu.shape}.")
+  safe_sigma = _make_safe_for_division(sigma)
   if reverse:
-    return x * sigma + mu
+    return x * safe_sigma + mu
   else:
-    return (x - mu) / _make_safe_for_division(sigma)
+    return (x - mu) / safe_sigma
 
 
 def get_output_patch_via_roll(
@@ -276,16 +263,12 @@ def get_output_patch_via_roll(
   """
   b, v, n, p = x.shape
   device = x.device
-  rolling_mat = torch.zeros(b, v, n, rolls + 1, p, device=device, dtype=x.dtype)
-  rolling_mat[:, :, :, 0, :] = x
-
-  for i in range(rolls):
-    rolling_mat[:, :, :, i + 1, :] = torch.roll(
-      rolling_mat[:, :, :, i, :], shifts=-1, dims=2
-    )
-
-  # Take [1:] along the roll axis and flatten
-  result = rolling_mat[:, :, :, 1:, :].reshape(b, v, n, rolls * p)
+  # Gather the future patches directly instead of allocating a rolling
+  # workspace and then copying its non-contiguous slice during reshape.
+  future_patch = torch.arange(n, device=device)[:, None] + torch.arange(
+    1, rolls + 1, device=device
+  )[None, :]
+  result = x[:, :, future_patch.remainder(n), :].reshape(b, v, n, rolls * p)
 
   # Build wrap-around mask
   patch_idx = torch.arange(n, device=device)
@@ -378,10 +361,16 @@ def stitch_patches(
 
   middles = next_patches[:, :, :, overlap:patch_len, :]
 
-  output_chunks = torch.cat([stitched_overlaps, middles], dim=3)
-
-  mid = output_chunks.reshape(b, v, (num_patches - 1) * patch_len, q)
-
-  tail = patch_preds[:, :, -1, patch_len:, :]
-
-  return torch.cat([first_chunk, mid, tail], dim=2)
+  result = torch.empty(
+    (b, v, num_patches * patch_len + overlap, q),
+    dtype=patch_preds.dtype,
+    device=patch_preds.device,
+  )
+  result[:, :, :patch_len, :] = first_chunk
+  middle = result[:, :, patch_len : num_patches * patch_len, :].view(
+    b, v, num_patches - 1, patch_len, q
+  )
+  middle[:, :, :, :overlap, :] = stitched_overlaps
+  middle[:, :, :, overlap:, :] = middles
+  result[:, :, num_patches * patch_len :, :] = patch_preds[:, :, -1, patch_len:, :]
+  return result

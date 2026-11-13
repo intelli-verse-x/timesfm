@@ -54,6 +54,17 @@ class RotaryEmbeddingTest(unittest.TestCase):
     out = rope(x)
     self.assertEqual(out.shape, (2, 8, 16))
 
+  def test_rope_preserves_low_precision_dtype(self):
+    for dtype in (torch.bfloat16, torch.float16):
+      for shape in ((2, 4, 16), (2, 4, 2, 16)):
+        with self.subTest(dtype=dtype, shape=shape):
+          rope = torch_trans.RotaryPositionalEmbedding(embedding_dims=16)
+          x = torch.randn(shape).to(dtype)
+          expected = rope(x.float()).to(dtype)
+          out = rope(x)
+          self.assertEqual(out.dtype, dtype)
+          torch.testing.assert_close(out, expected)
+
   def test_rope_with_position(self):
     rope = torch_trans.RotaryPositionalEmbedding(embedding_dims=16)
     x = torch.randn(2, 4, 16)
@@ -93,6 +104,23 @@ class MultiHeadAttentionTest(unittest.TestCase):
     self.assertEqual(out_step.shape, (b, 1, d))
     self.assertIsNotNone(updated_cache)
     self.assertEqual(updated_cache.next_index[0].item(), 1)
+
+  def test_mha_low_precision(self):
+    for dtype in (torch.bfloat16, torch.float16):
+      for use_sdpa in (False, True):
+        for use_rope in (False, True):
+          with self.subTest(dtype=dtype, sdpa=use_sdpa, rope=use_rope):
+            mha = torch_trans.MultiHeadAttention(
+              num_heads=2,
+              in_features=16,
+              use_rotary_position_embeddings=use_rope,
+              use_sdpa=use_sdpa,
+            ).to(dtype=dtype)
+            x = torch.randn(2, 4, 16).to(dtype)
+            out, _, _ = mha(x)
+            self.assertEqual(out.dtype, dtype)
+            self.assertEqual(out.shape, x.shape)
+            self.assertTrue(torch.isfinite(out).all())
 
   def test_mha_decode_heterogeneous_batch(self):
     """Verifies that heterogeneous sequence offsets within a batch do not corrupt KV cache."""
@@ -159,6 +187,47 @@ class MultiHeadAttentionTest(unittest.TestCase):
     torch.testing.assert_close(
       updated_batched_cache.value[1:2], updated_cache_b.value, rtol=1e-5, atol=1e-5
     )
+
+
+class SinglePositionAttentionTest(unittest.TestCase):
+  """single_position_forward must equal full attention over one key."""
+
+  def _check(self, use_sdpa, v_norm, rescale_logits):
+    torch.manual_seed(0)
+    mha = torch_trans.MultiHeadAttention(
+      num_heads=4,
+      in_features=64,
+      use_rotary_position_embeddings=True,
+      causal_attention=False,
+      v_norm=v_norm,
+      use_sdpa=use_sdpa,
+      rescale_logits=rescale_logits,
+    ).double()
+    x = torch.randn(10, 1, 64, dtype=torch.float64)
+    patch_mask = torch.zeros(10, 1, dtype=torch.bool)
+    patch_mask[3, 0] = True
+    with torch.no_grad():
+      ref, _, _ = mha(x, patch_mask=patch_mask)
+      fast = mha.single_position_forward(x)
+    self.assertEqual(fast.shape, ref.shape)
+
+    # Softmax over one key is exactly 1.0, so unmasked rows match bit for bit.
+    unmasked = ~patch_mask[:, 0]
+    torch.testing.assert_close(fast[unmasked], ref[unmasked], rtol=0, atol=0)
+
+    # Masked row. The manual path still gives the single key weight 1.0, and
+    # the fast path matches it. SDPA returns a different value for a fully
+    # masked row; that value is never read downstream (see
+    # SingleVariateFastPathTest in model_test.py), so it is not compared here.
+    if not use_sdpa:
+      torch.testing.assert_close(fast[3], ref[3], rtol=0, atol=0)
+
+  def test_matches_full_attention(self):
+    for use_sdpa in (True, False):
+      for v_norm in ("none", "rms"):
+        for rescale_logits in (True, False):
+          with self.subTest(use_sdpa=use_sdpa, v_norm=v_norm, rescale=rescale_logits):
+            self._check(use_sdpa, v_norm, rescale_logits)
 
 
 class MixingTransformerTest(unittest.TestCase):

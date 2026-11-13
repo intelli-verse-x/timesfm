@@ -15,7 +15,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26.4",
-    "huggingface_hub>=0.28.0",
+    "huggingface_hub>=0.30.0",
     "safetensors>=0.5.3",
 ]
 
@@ -28,17 +28,33 @@ mlx = [
     "safetensors>=0.4.0",
     "huggingface-hub>=0.24.0",
 ]
+# CPU-compatible (works on any machine)
 flax = [
-    "flax",
-    "optax",
-    "einshape",
-    "orbax-checkpoint",
-    "jaxtyping",
-    "jax[cuda]"
+  "flax",
+  "optax",
+  "einshape",
+  "orbax-checkpoint",
+  "jaxtyping",
+  "jax",
 ]
+# GPU only (CUDA 12)
+flax-cuda = [
+  "flax",
+  "optax",
+  "einshape",
+  "orbax-checkpoint",
+  "jaxtyping",
+  "jax[cuda12]",
+]
+# CPU-compatible
 xreg = [
-    "jax[cuda]",
-    "scikit-learn",
+  "jax",
+  "scikit-learn",
+]
+# GPU only (CUDA 12)
+xreg-cuda = [
+  "jax[cuda12]",
+  "scikit-learn",
 ]
 
 [tool.ruff]
@@ -52,4 +68,5 @@ where = ["src"]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-
+[tool.setuptools.package-data]
+timesfm = ["py.typed"]
