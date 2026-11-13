@@ -1,0 +1,76 @@
+name: Fork Torch CPU compatibility
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [sync/upstream-master-2026-11-12]
+
+permissions:
+  contents: read
+
+jobs:
+  source-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install CPU-only backend and local package
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install .
+      - name: Run Torch and legacy namespace tests without downloading checkpoints
+        env:
+          HF_HUB_OFFLINE: '1'
+          OMP_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+          CUDA_VISIBLE_DEVICES: ''
+        run: >
+          python -m unittest -v
+          timesfm3.backward_compat_test
+          timesfm3.torch.primitives_test
+          timesfm3.torch.cpm_revin_refine_test
+          timesfm3.torch.transformer_test
+          timesfm3.torch.model_test
+          timesfm3.torch.timesfm3_forecaster_test
+
+  mlx-tests:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      HF_HUB_OFFLINE: '1'
+      OMP_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install local package and Apple Silicon backends
+        run: python -m pip install '.[mlx,torch]'
+      - name: Test synthetic models, numerical parity and bounded batches offline
+        env:
+          HF_HOME: ${{ runner.temp }}/timesfm-no-weights
+        run: |
+          python - <<'PYTEST'
+          import platform
+          import unittest
+          import mlx.core as mx
+          assert platform.machine() == 'arm64', 'Apple Silicon runner required'
+          mx.set_default_device(mx.cpu)
+          suite = unittest.defaultTestLoader.loadTestsFromNames([
+              'timesfm3.mlx.timesfm3_forecaster_test',
+              'timesfm3.mlx.model_parity_test',
+              'timesfm3.mlx.bounded_batch_test',
+          ])
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and result.testsRun > 0 else 1)
+          PYTEST
