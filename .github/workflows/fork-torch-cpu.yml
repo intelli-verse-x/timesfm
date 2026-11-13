@@ -45,7 +45,6 @@ jobs:
     timeout-minutes: 20
     env:
       HF_HUB_OFFLINE: '1'
-      HF_HOME: ${{ runner.temp }}/timesfm-no-weights
       OMP_NUM_THREADS: '2'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -58,6 +57,8 @@ jobs:
       - name: Install local package and Apple Silicon backends
         run: python -m pip install '.[mlx,torch]'
       - name: Test synthetic models, numerical parity and bounded batches offline
+        env:
+          HF_HOME: ${{ runner.temp }}/timesfm-no-weights
         run: |
           python - <<'PYTEST'
           import platform
