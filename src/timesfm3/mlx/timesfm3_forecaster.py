@@ -188,6 +188,8 @@ class TimesFM3Forecaster:
     """
     if padding_mode not in ("none", "edge"):
       raise ValueError(f"Unknown padding_mode: {padding_mode!r}")
+    if self.config.per_core_batch_size <= 0:
+      raise ValueError("per_core_batch_size must be positive")
     if len(contexts) == 0:
       return
 
@@ -271,15 +273,20 @@ class TimesFM3Forecaster:
       for i, a in enumerate(arrs):
         groups.setdefault(a.shape[0], []).append(i)
       for _length, idxs in groups.items():
-        batch = mx.array(np.stack([arrs[i] for i in idxs]))[:, None, :]
-        logits = np.array(self.model.decode(batch, horizon))  # (B, 1, h, q)
-        if sort_quantiles:
-          logits = np.sort(logits, axis=-1)
-        for bi, i in enumerate(idxs):
-          forecast, quantiles = _shape(logits[bi], 1, True, arrs[i][None, :])
-          results[i] = ForecastOutput(
-            ts_id=ids[i], forecast=forecast, quantiles=quantiles
-          )
+        # Bound each forward pass by the configured batch size; length grouping
+        # must not put an arbitrarily large collection on the device at once.
+        batch_size = self.config.per_core_batch_size
+        for start in range(0, len(idxs), batch_size):
+          chunk = idxs[start : start + batch_size]
+          batch = mx.array(np.stack([arrs[i] for i in chunk]))[:, None, :]
+          logits = np.array(self.model.decode(batch, horizon))  # (B, 1, h, q)
+          if sort_quantiles:
+            logits = np.sort(logits, axis=-1)
+          for bi, i in enumerate(chunk):
+            forecast, quantiles = _shape(logits[bi], 1, True, arrs[i][None, :])
+            results[i] = ForecastOutput(
+              ts_id=ids[i], forecast=forecast, quantiles=quantiles
+            )
     else:
       # General path: multivariate targets, covariates, symmetric averaging,
       # z-normalization and/or padding, one series at a time.
