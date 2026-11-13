@@ -6,23 +6,23 @@ model developed by Google Research for time-series forecasting.
 *   Paper:
     [A decoder-only foundation model for time-series forecasting](https://arxiv.org/abs/2310.10688),
     ICML 2024.
-*   <span style="color:red">(NEW!)</span> TimesFM 3.0 Checkpoint:
-    [`google/timesfm-3.0-pytorch`](https://huggingface.co/google/timesfm-3.0-pytorch).
-*   Checkpoints (up to 2.5):
+*   🆕 TimesFM 3.0 Checkpoint:
+    [`google/timesfm-3.0-pytorch`](https://huggingface.co/google/timesfm-3.0-pytorch). Checkpoints up to 2.5:
     [TimesFM Hugging Face Collection](https://huggingface.co/collections/google/timesfm-release-66e4be5fdb56e960c1e482a6).
-*   [Google Research blog](https://research.google/blog/a-decoder-only-foundation-model-for-time-series-forecasting/)
-    (New blog post for TimesFM 3.0 coming soon!).
+*   Google Reseach blog posts:
+    * [TimesFM-3: A zero-shot foundation model for multivariate forecasting](https://research.google/blog/timesfm-3-a-zero-shot-foundation-model-for-multivariate-forecasting/)
+    * [A decoder-only foundation model for time-series forecasting](https://research.google/blog/a-decoder-only-foundation-model-for-time-series-forecasting/)   
 *   TimesFM in Google 1P Products:
     *   [BigQuery ML](https://cloud.google.com/bigquery/docs/timesfm-model):
         Enterprise level SQL queries for scalability and reliability.
     *   [Google Sheets](https://workspaceupdates.googleblog.com/2026/02/forecast-data-in-connected-sheets-BigQueryML-TimesFM.html):
         For your daily spreadsheet.
-    *   [Vertex Model Garden](https://pantheon.corp.google.com/vertex-ai/publishers/google/model-garden/timesfm):
+    *   [Vertex Model Garden](https://console.cloud.google.com/vertex-ai/publishers/google/model-garden/timesfm):
         Dockerized endpoint for agentic calling.
 
 This open version is not an officially supported Google product.
 
-**Latest Model Version:** TimesFM 3.0
+**Latest Model Version:** TimesFM 3.0 ✨
 
 **Archived Model Versions:**
 
@@ -32,6 +32,9 @@ This open version is not an officially supported Google product.
     them.
 
 --------------------------------------------------------------------------------
+## Update — September 2026
+
+TimesFM 3.0 finishes rollout in Google Cloud [BigQuery ML](https://docs.cloud.google.com/bigquery/docs/timesfm-model), supporting commercial and production uses (see clarified [license notice](https://github.com/google-research/timesfm#license-notice-for-pretrained-weights)).
 
 ## Update — August 2026
 
@@ -57,12 +60,9 @@ time-series foundation model benchmarks.
 
 ### License notice for pretrained weights
 
-> **Important:** The TimesFM source code in this repository is licensed under
-> Apache-2.0, and model weights up to version 2.5 remain Apache-2.0. However,
-> for the time being, TimesFM 3.0 pretrained weights are distributed under the
-> separate `timesfm-non-commercial-license-v1.0` license and are restricted to
-> non-commercial, non-production use. Commercial or production use of the
-> default pretrained weights is **not permitted**.
+> **Important:** The TimesFM source code in this repository is licensed under `Apache-2.0`, and model weights up to version 2.5 remain `Apache-2.0`. However, TimesFM 3.0 pretrained weights are distributed under the separate [`timesfm-non-commercial-license-v1.0`](https://huggingface.co/google/timesfm-3.0-pytorch/blob/main/LICENSE) license and are restricted to non-commercial, non-production use. Commercial or production use of downloaded / self-hosted weights is **not permitted**.
+
+> **Commercial & Production Use:** Commercial and production use of TimesFM 3.0 is **fully permitted** through authorized Google Cloud services, including [BigQuery ML](https://docs.cloud.google.com/bigquery/docs/timesfm-model), which are governed by the [Google Cloud Terms of Service](https://cloud.google.com/product-terms).
 
 --------------------------------------------------------------------------------
 
@@ -123,6 +123,9 @@ TimesFM 2.5:
 ```shell
 # Install TimesFM with PyTorch
 pip install timesfm[torch]
+
+# Or, for MLX-native inference on Apple silicon (no PyTorch required)
+pip install timesfm[mlx]
 ```
 
 #### Local Install
@@ -179,6 +182,72 @@ print("Series 1 quantiles shape:", outputs[0].quantiles.shape) # (12, 9)
 print("Series 2 forecast shape:", outputs[1].forecast.shape)   # (12,)
 print("Series 2 quantiles shape:", outputs[1].quantiles.shape) # (12, 9)
 ```
+
+#### Apple Silicon: MLX backend
+
+An MLX-native backend runs TimesFM 3.0 on Apple silicon without PyTorch. It mirrors the PyTorch
+`TimesFM3Forecaster` interface (`predict` / `predict_batch`, univariate or multivariate, with
+past-only and past-future covariates) and is numerically matched to it on
+`google/timesfm-3.0-pytorch`. Median forecast / quantile max abs error, context 512: `9.5e-7` /
+`1.8e-6` at horizon 64, `2.3e-6` / `2.7e-6` at horizon 128 (longer horizons stitch multiple output
+patches, so they are worth checking on their own).
+
+```python
+import numpy as np
+from timesfm3.mlx import TimesFM3Forecaster
+
+forecaster = TimesFM3Forecaster.from_pretrained("google/timesfm-3.0-pytorch")
+
+# Univariate, long horizon (>= 128 spans several output patches).
+context = np.sin(np.linspace(0, 40, 512)).astype(np.float32)
+out = forecaster.predict(context, horizon=128, return_quantiles=True)
+print(out.forecast.shape)    # (128,)      median forecast
+print(out.quantiles.shape)   # (128, 9)    9 deciles
+
+# Batch many series through one forward pass.
+outs = list(forecaster.predict_batch([context] * 32, horizon=128))
+```
+
+Multivariate targets and covariates work the same way as on the PyTorch backend (matched to
+`1.7e-6` on the checkpoint):
+
+```python
+context_len, horizon = 256, 32
+
+# Two target variates: (num_variates, context_len).
+target = np.stack([
+    np.sin(np.linspace(0, 24, context_len)),
+    np.sin(np.linspace(1, 26, context_len)),
+]).astype(np.float32)
+
+past_only = np.random.randn(1, context_len).astype(np.float32)          # (1, 256)
+past_future = np.sin(                                                    # (1, 256 + 32)
+    np.linspace(0, 30, context_len + horizon)
+)[None, :].astype(np.float32)
+
+out = forecaster.predict(
+    target,
+    horizon=horizon,
+    past_only_covariates=past_only,
+    past_future_covariates=past_future,
+    return_quantiles=True,
+)
+print(out.forecast.shape)    # (2, 32)     one forecast per target variate
+print(out.quantiles.shape)   # (2, 32, 9)
+```
+
+Benchmarks (330M model, Apple M4 Max, context 512, horizon 64, fp32 with `mx.compile`):
+
+| batch | p50 latency | throughput |
+|------:|------------:|-----------:|
+|     1 |     11.1 ms |   90 series/s |
+|     8 |     19.7 ms |  406 series/s |
+|    32 |     48.1 ms |  666 series/s |
+
+Contexts longer than `global_context` (15,360) are truncated to their most recent points before
+decode, matching the PyTorch backend. `use_symmetric_averaging`, `use_znorm`, and `padding_mode`
+(`"none"` / `"edge"`) are all supported and numerically matched to the PyTorch backend, so the MLX
+forecaster is a drop-in for the univariate and covariate forecasting paths.
 
 #### 2. Multivariate Forecasting with Covariates
 
